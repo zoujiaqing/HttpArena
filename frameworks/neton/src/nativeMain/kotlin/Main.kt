@@ -1,5 +1,7 @@
 import kotlin.native.runtime.GC
 import kotlin.native.runtime.NativeRuntimeApi
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,6 +28,8 @@ import neton.core.http.HttpStatus
 import neton.core.http.adapter.HttpServerConfig
 import neton.http.http
 import neton.http.hyper4k.Hyper4kHttpAdapter
+import neton.http.static.staticFiles
+import neton.core.http.adapter.TlsSettings
 import neton.routing.*
 
 /**
@@ -57,6 +61,16 @@ import neton.routing.*
  */
 private const val H1_PORT = 8080
 private val H2C_PORT = getEnv("ARENA_H2C_PORT")?.toIntOrNull() ?: 8082
+// TLS listeners. 8081 serves the HTTP/1.1 + TLS profiles (json-tls, static-tls,
+// 8gbit, tls); 8443 serves the HTTP/2 + TLS ones (baseline-h2, static-h2) via
+// ALPN. Certificates are mounted read-only at /certs by the harness. Overridable
+// so a dev machine need not hold the harness ports or certs.
+private val H1TLS_PORT = getEnv("ARENA_H1TLS_PORT")?.toIntOrNull() ?: 8081
+private val H2TLS_PORT = getEnv("ARENA_H2TLS_PORT")?.toIntOrNull() ?: 8443
+private val CERT_PATH = getEnv("ARENA_CERT") ?: "/certs/server.crt"
+private val KEY_PATH = getEnv("ARENA_KEY") ?: "/certs/server.key"
+private val STATIC_DIR = getEnv("ARENA_STATIC") ?: "/data/static"
+private val TLS_ENABLED = readConfigFile(CERT_PATH) != null && readConfigFile(KEY_PATH) != null
 
 /**
  * Mounted read-only by the harness: -v data/dataset.json:/data/dataset.json:ro.
@@ -113,9 +127,30 @@ fun main(args: Array<String>) {
             get("/pipeline") { it.response.text("ok") }
             get("/delay/{ms}") { it.writeDelay() }
             get("/json/{count}") { it.writeItems(items) }
+
+            // 8gbit: read the posted body through the standard API and write it
+            // back verbatim — not from Content-Length, so chunked echoes too.
+            post("/echo") { it.echoBody() }
+
+            // static-tls / static-h2: serve the mounted files with pre-compressed
+            // .br/.gz variants selected off Accept-Encoding by the framework.
+            staticFiles("/static", STATIC_DIR) { precompressed = true }
         }
 
-        onReady { startH2cListener(this) }
+        onReady {
+            // Each listener is awaited to its bind before READY returns, so the
+            // harness never probes a TLS port that is not up yet. A listener that
+            // fails to bind fails the launch rather than leaving a silent gap.
+            check(startListener(this, H2C_PORT, null)) { "h2c listener failed to bind on $H2C_PORT" }
+            if (TLS_ENABLED) {
+                check(startListener(this, H1TLS_PORT, TlsSettings(CERT_PATH, KEY_PATH, listOf("http/1.1")))) {
+                    "h1+TLS listener failed to bind on $H1TLS_PORT"
+                }
+                check(startListener(this, H2TLS_PORT, TlsSettings(CERT_PATH, KEY_PATH, listOf("h2", "http/1.1")))) {
+                    "h2+TLS listener failed to bind on $H2TLS_PORT"
+                }
+            }
+        }
     }
 }
 
@@ -265,20 +300,47 @@ private class ArenaItems(private val source: List<SourceItem>) {
  * Same frozen context, so both listeners serve an identical route table and
  * hyper4k negotiates HTTP/1.1 or HTTP/2 per connection on either of them.
  */
-private fun startH2cListener(application: KotlinApplication) {
+/** /echo: hand back exactly the bytes that arrived. */
+private suspend fun HttpContext.echoBody() {
+    val body = request.body()
+    response.contentType = "application/octet-stream"
+    response.write(body)
+}
+
+/**
+ * Brings up a TLS listener sharing the frozen route table. [alpn] is the server's
+ * preference order: `["http/1.1"]` on 8081, `["h2","http/1.1"]` on 8443, so ALPN
+ * chooses the protocol per connection.
+ */
+/**
+ * Brings up one listener sharing the frozen route table and returns only once it
+ * has bound (or failed). [tls] null serves cleartext; non-null terminates TLS
+ * with the given ALPN. The serve loop runs for the process lifetime on its own
+ * scope; this function returns as soon as the bind is confirmed so READY can gate
+ * on every listener being up.
+ */
+private suspend fun startListener(
+    application: KotlinApplication,
+    port: Int,
+    tls: TlsSettings?,
+): Boolean {
     val context = application.get<NetonContext>()
-    // Copy the config the framework already resolved from application.conf and
-    // change only the port. Spelling the fields out again here meant the h2c
-    // listener silently ignored the file: the h1 listener ran with the
-    // configured timeout and connection ceiling while this one kept whatever
-    // was hard-coded, so the two listeners were never the same server and no
-    // config-level experiment could reach the h2c profiles.
     val adapter = Hyper4kHttpAdapter(
-        context.get(HttpServerConfig::class).copy(port = H2C_PORT),
+        context.get(HttpServerConfig::class).copy(port = port, tls = tls),
     )
-    // start() holds the listener open for the process lifetime and never
-    // returns, so it cannot run on the framework's own start path.
+    val bound = CompletableDeferred<Unit>()
     CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
-        adapter.start(context, null)
+        try {
+            adapter.start(context) { bound.complete(Unit) }
+        } catch (e: Throwable) {
+            bound.completeExceptionally(e)
+        }
+    }
+    return try {
+        withTimeout(10_000) { bound.await() }
+        true
+    } catch (_: Throwable) {
+        false
     }
 }
+
