@@ -143,6 +143,10 @@ fun main(args: Array<String>) {
             // {count, items:[{..., active:bool, tags:[...], rating:{score,count}}]}.
             get("/async-db") { it.writeDbItems() }
 
+            // fortunes: TechEmpower template benchmark — all fortune rows + one
+            // runtime row, sorted by message, rendered as escaped HTML.
+            get("/fortunes") { it.writeFortunes() }
+
             // 8gbit: read the posted body through the standard API and write it
             // back verbatim — not from Content-Length, so chunked echoes too.
             post("/echo") { it.echoBody() }
@@ -242,6 +246,42 @@ private suspend fun HttpContext.writeDbItems() {
     sb.append("]}")
     response.contentType = "application/json; charset=utf-8"
     response.write(sb.toString().encodeToByteArray())
+}
+
+/**
+ * /fortunes: every row of the fortune table plus one row injected at request time,
+ * sorted by message, rendered as an HTML table with each message HTML-escaped
+ * (the seeded row 11 carries a raw <script> that must come out as &lt;script&gt;).
+ */
+private suspend fun HttpContext.writeFortunes() {
+    val rows = dbContext().fetchAll("SELECT id, message FROM fortune", emptyMap())
+    val fortunes = ArrayList<Pair<Int, String>>(rows.size + 1)
+    for (r in rows) fortunes.add(r.int("id") to r.string("message"))
+    fortunes.add(0 to "Additional fortune added at request time.")
+    fortunes.sortBy { it.second }
+    val sb = StringBuilder(24576)
+    sb.append("<!DOCTYPE html><html><head><title>Fortunes</title></head><body><table>")
+    sb.append("<tr><th>id</th><th>message</th></tr>")
+    for ((id, msg) in fortunes) {
+        sb.append("<tr><td>").append(id).append("</td><td>")
+        appendHtmlEscaped(sb, msg)
+        sb.append("</td></tr>")
+    }
+    sb.append("</table></body></html>")
+    response.contentType = "text/html; charset=utf-8"
+    response.write(sb.toString().encodeToByteArray())
+}
+
+/** HTML-escape row text so user content cannot break out of the table cell. */
+private fun appendHtmlEscaped(sb: StringBuilder, s: String) {
+    for (c in s) when (c) {
+        '<' -> sb.append("&lt;")
+        '>' -> sb.append("&gt;")
+        '&' -> sb.append("&amp;")
+        '"' -> sb.append("&quot;")
+        '\'' -> sb.append("&#39;")
+        else -> sb.append(c)
+    }
 }
 
 /** Minimal JSON string emitter for the DB text columns (name/category). */

@@ -29,7 +29,8 @@
     "static-tls",
     "baseline-h2",
     "static-h2",
-    "async-db"
+    "async-db",
+    "fortunes"
   ],
   "maintainers": [
     "zoujiaqing"
