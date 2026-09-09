@@ -23,6 +23,7 @@
     "latency-500k-8cpu",
     "baseline-h2c",
     "json-h2c",
+    "json-comp",
     "json-tls",
     "8gbit",
     "static-tls",

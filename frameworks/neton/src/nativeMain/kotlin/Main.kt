@@ -46,8 +46,10 @@ import neton.routing.*
  * same socket by prior knowledge, so the second listener is a second adapter
  * over the same frozen context, not a second application.
  *
- * Not subscribed (see meta.json): the TLS profiles — the engine terminates no
- * TLS today — plus json-comp, which needs gzip/br response compression.
+ * Not subscribed (see meta.json): the profiles that need capabilities the engine
+ * does not have yet — HTTP/3, gRPC, WebSocket — and the multi-service DB profiles
+ * (async-db, fortunes, production-stack). json-comp is served here: the framework
+ * gzip-compresses compressible responses when the client sends Accept-Encoding.
  */
 
 /**
