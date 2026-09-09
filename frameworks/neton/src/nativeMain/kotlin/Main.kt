@@ -26,6 +26,8 @@ import neton.core.config.readConfigFile
 import neton.core.http.HttpContext
 import neton.core.http.HttpStatus
 import neton.core.http.adapter.HttpServerConfig
+import neton.database.database
+import neton.database.dbContext
 import neton.http.http
 import neton.http.hyper4k.Hyper4kHttpAdapter
 import neton.http.static.staticFiles
@@ -119,6 +121,13 @@ fun main(args: Array<String>) {
             port = H1_PORT
         }
 
+        // async-db / fortunes need Postgres. Gated so the baseline A/B can run the
+        // exact same binary with the DB out of the picture (ARENA_DB=0): the plain
+        // profiles never touch the pool, and this proves it costs them nothing.
+        if (getEnv("ARENA_DB") != "0") {
+            database { }
+        }
+
         routing {
             get("/baseline11") { it.writeSum() }
             post("/baseline11") { it.writeSum(withBody = true) }
@@ -129,6 +138,10 @@ fun main(args: Array<String>) {
             get("/pipeline") { it.response.text("ok") }
             get("/delay/{ms}") { it.writeDelay() }
             get("/json/{count}") { it.writeItems(items) }
+
+            // async-db: async Postgres sequential scan (no index on price) →
+            // {count, items:[{..., active:bool, tags:[...], rating:{score,count}}]}.
+            get("/async-db") { it.writeDbItems() }
 
             // 8gbit: read the posted body through the standard API and write it
             // back verbatim — not from Content-Length, so chunked echoes too.
@@ -194,6 +207,58 @@ private suspend fun HttpContext.writeItems(items: ArenaItems) {
     // String to UTF-8 — a second full pass over the payload for nothing.
     response.contentType = "application/json; charset=utf-8"
     response.write(items.render(request.pathParam("count"), request.queryParam("m")))
+}
+
+/**
+ * /async-db?min=&max=&limit=: rows from Postgres selected by price range. There is
+ * no index on price, so this is a sequential scan — the point of the profile. The
+ * body is built straight to bytes; `tags` is a JSONB column whose text is already a
+ * valid JSON array, so it is embedded verbatim.
+ */
+private suspend fun HttpContext.writeDbItems() {
+    val min = request.queryParam("min")?.toIntOrNull() ?: 0
+    val max = request.queryParam("max")?.toIntOrNull() ?: Int.MAX_VALUE
+    val limit = (request.queryParam("limit")?.toIntOrNull() ?: 1).coerceIn(0, 1000)
+    val rows = dbContext().fetchAll(
+        "SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count " +
+            "FROM items WHERE price BETWEEN :min AND :max LIMIT :limit",
+        mapOf("min" to min, "max" to max, "limit" to limit),
+    )
+    val sb = StringBuilder(64 + rows.size * 160)
+    sb.append("{\"count\":").append(rows.size).append(",\"items\":[")
+    for (i in rows.indices) {
+        val r = rows[i]
+        if (i > 0) sb.append(',')
+        sb.append("{\"id\":").append(r.int("id"))
+        sb.append(",\"name\":"); appendJsonString(sb, r.string("name"))
+        sb.append(",\"category\":"); appendJsonString(sb, r.string("category"))
+        sb.append(",\"price\":").append(r.int("price"))
+        sb.append(",\"quantity\":").append(r.int("quantity"))
+        sb.append(",\"active\":").append(r.boolean("active"))
+        sb.append(",\"tags\":").append(r.string("tags"))
+        sb.append(",\"rating\":{\"score\":").append(r.int("rating_score"))
+        sb.append(",\"count\":").append(r.int("rating_count")).append("}}")
+    }
+    sb.append("]}")
+    response.contentType = "application/json; charset=utf-8"
+    response.write(sb.toString().encodeToByteArray())
+}
+
+/** Minimal JSON string emitter for the DB text columns (name/category). */
+private fun appendJsonString(sb: StringBuilder, value: String) {
+    sb.append('"')
+    for (c in value) {
+        when {
+            c == '"' -> sb.append("\\\"")
+            c == '\\' -> sb.append("\\\\")
+            c == '\n' -> sb.append("\\n")
+            c == '\r' -> sb.append("\\r")
+            c == '\t' -> sb.append("\\t")
+            c.code < 0x20 -> sb.append("\\u").append(c.code.toString(16).padStart(4, '0'))
+            else -> sb.append(c)
+        }
+    }
+    sb.append('"')
 }
 
 /**

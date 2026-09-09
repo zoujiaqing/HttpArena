@@ -16,7 +16,13 @@ kotlin {
     // The arena builds linuxX64; macosArm64 is here so the endpoints can be
     // exercised on a developer machine.
     listOf(macosArm64(), linuxX64(), linuxArm64()).forEach { target ->
-        target.binaries.executable { entryPoint = "main" }
+        target.binaries.executable {
+            entryPoint = "main"
+            // hyper4k and sqlx4k (neton-database) are each a Rust static library, so
+            // both bundle the Rust runtime — linking both defines rust_eh_personality
+            // (and friends) twice. The copies are identical; take the first.
+            linkerOpts("--allow-multiple-definition")
+        }
     }
 
     sourceSets {
@@ -27,6 +33,8 @@ kotlin {
             dependsOn(commonMain.get())
             dependencies {
                 implementation("com.netonstream:neton:$netonVersion")
+                // async-db / fortunes: async Postgres via sqlx4k.
+                implementation("com.netonstream:neton-database:$netonVersion")
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
                 // Encoding straight into a byte buffer, rather than to a String the
