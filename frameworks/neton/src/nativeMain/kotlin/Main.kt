@@ -26,8 +26,12 @@ import neton.core.config.readConfigFile
 import neton.core.http.HttpContext
 import neton.core.http.HttpStatus
 import neton.core.http.adapter.HttpServerConfig
-import neton.database.database
 import neton.database.dbContext
+import neton.database.adapter.sqlx.SqlxDatabase
+import neton.database.config.DatabaseConfig
+import neton.database.config.DatabaseDriver
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import neton.http.http
 import neton.http.hyper4k.Hyper4kHttpAdapter
 import neton.http.static.staticFiles
@@ -121,12 +125,11 @@ fun main(args: Array<String>) {
             port = H1_PORT
         }
 
-        // async-db / fortunes need Postgres. Gated so the baseline A/B can run the
-        // exact same binary with the DB out of the picture (ARENA_DB=0): the plain
-        // profiles never touch the pool, and this proves it costs them nothing.
-        if (getEnv("ARENA_DB") != "0") {
-            database { }
-        }
+        // The Postgres pool (sqlx4k) stands up its own Rust/Tokio runtime; doing that
+        // at startup made the DB-free profiles (baseline etc.) share the box with a
+        // second multi-threaded runtime. Initialise it lazily on the first DB request
+        // instead, so the plain profiles never pay for it. async-db/fortunes take a
+        // one-time init on their first hit.
 
         routing {
             get("/baseline11") { it.writeSum() }
@@ -219,7 +222,28 @@ private suspend fun HttpContext.writeItems(items: ArenaItems) {
  * body is built straight to bytes; `tags` is a JSONB column whose text is already a
  * valid JSON array, so it is embedded verbatim.
  */
+private val dbMutex = Mutex()
+
+@kotlin.concurrent.Volatile
+private var dbReady = false
+
+/** Lazily stand up the Postgres pool on the first DB request; idempotent. */
+private suspend fun ensureDb() {
+    if (dbReady) return
+    dbMutex.withLock {
+        if (dbReady) return
+        SqlxDatabase.initialize(
+            DatabaseConfig(
+                driver = DatabaseDriver.POSTGRESQL,
+                uri = "postgresql://bench:bench@localhost:5432/benchmark",
+            ),
+        )
+        dbReady = true
+    }
+}
+
 private suspend fun HttpContext.writeDbItems() {
+    ensureDb()
     val min = request.queryParam("min")?.toIntOrNull() ?: 0
     val max = request.queryParam("max")?.toIntOrNull() ?: Int.MAX_VALUE
     val limit = (request.queryParam("limit")?.toIntOrNull() ?: 1).coerceIn(0, 1000)
@@ -254,6 +278,7 @@ private suspend fun HttpContext.writeDbItems() {
  * (the seeded row 11 carries a raw <script> that must come out as &lt;script&gt;).
  */
 private suspend fun HttpContext.writeFortunes() {
+    ensureDb()
     val rows = dbContext().fetchAll("SELECT id, message FROM fortune", emptyMap())
     val fortunes = ArrayList<Pair<Int, String>>(rows.size + 1)
     for (r in rows) fortunes.add(r.int("id") to r.string("message"))
