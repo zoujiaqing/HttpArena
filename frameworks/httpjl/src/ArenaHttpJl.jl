@@ -1,6 +1,6 @@
 module ArenaHttpJl
 
-using HTTP, JSON3, StructTypes, CodecZlib, TranscodingStreams
+using HTTP, JSON3, StructTypes, LibDeflate
 # Reseau is HTTP.jl's own transport, so its TLS is the standard stack here rather
 # than a second one bolted on. Imported as modules, not `using`, to keep names
 # like `listen`/`accept`/`Conn` out of this namespace.
@@ -142,15 +142,22 @@ end
 is_space(c::UInt8) = c == UInt8(' ') || c == UInt8('\t') || c == UInt8('\r') || c == UInt8('\n')
 
 function body_int(stream::HTTP.Stream)
-    bytes = read(stream)
-    lo, hi = 1, length(bytes)
-    @inbounds while lo <= hi && is_space(bytes[lo])
+    buf = Vector{UInt8}(undef, 64)
+    n = readbytes!(stream, buf)
+    while !eof(stream)
+        n == length(buf) && resize!(buf, 2 * length(buf))
+        m = readbytes!(stream, view(buf, n + 1:length(buf)))
+        m == 0 && break
+        n += m
+    end
+    lo, hi = 1, n
+    @inbounds while lo <= hi && is_space(buf[lo])
         lo += 1
     end
-    @inbounds while hi >= lo && is_space(bytes[hi])
+    @inbounds while hi >= lo && is_space(buf[hi])
         hi -= 1
     end
-    v = parse_int(bytes, lo, hi)
+    v = parse_int(buf, lo, hi)
     return v === nothing ? 0 : v
 end
 
@@ -211,30 +218,32 @@ end
 # ── handler ─────────────────────────────────────────────────────────────────
 
 # HTTP.jl ships no compression middleware, so json-comp is gzipped by hand with
-# CodecZlib. The compressors are pooled because deflateInit allocates a few
-# hundred KB of zlib state, too much to redo on every request; one per thread is
-# enough since a handler holds one only for the length of a transcode call.
+# LibDeflate. libdeflate compresses the same JSON to the same size or a little
+# smaller than zlib and does it about 2.5x faster, which is where the profile
+# spends most of its CPU. A compressor holds a few hundred KB of state, too much
+# to redo on every request, so there is one per thread: a Channel handing them
+# round puts every gzip behind one lock, and at the 4096 connections of
+# json-comp that lock, not the codec, was what the profile was full of. One
+# codec per thread is safe because a task does not migrate between threads
+# inside a non-yielding gzip_compress! call.
 struct App
-    gzip::Channel{GzipCompressor}
+    gzip::Vector{LibDeflate.Compressor}
 end
 
 function make_app(pool_size::Int = max(2, Threads.maxthreadid()))
-    pool = Channel{GzipCompressor}(pool_size)
-    for _ in 1:pool_size
-        codec = GzipCompressor()
-        TranscodingStreams.initialize(codec)
-        put!(pool, codec)
+    codecs = Vector{LibDeflate.Compressor}(undef, pool_size)
+    for i in 1:pool_size
+        codecs[i] = LibDeflate.Compressor(UInt8(6))
     end
-    return App(pool)
+    return App(codecs)
 end
 
 function gzip_body(app::App, bytes::Vector{UInt8})
-    codec = take!(app.gzip)
-    try
-        return transcode(codec, bytes)
-    finally
-        put!(app.gzip, codec)
-    end
+    codec = @inbounds app.gzip[Threads.threadid()]
+    out = Vector{UInt8}(undef, LibDeflate.gzip_compress_bound(codec, UInt64(length(bytes))))
+    n = LibDeflate.gzip_compress!(codec, out, bytes)::UInt
+    resize!(out, Int(n))
+    return out
 end
 
 function (app::App)(stream::HTTP.Stream)

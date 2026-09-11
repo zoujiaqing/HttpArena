@@ -1,4 +1,4 @@
-FROM julia:1.11.6-bookworm AS build
+FROM julia:1.13.0-bookworm AS build
 ENV JULIA_DEPOT_PATH=/depot
 WORKDIR /app
 COPY Project.toml Manifest.toml ./
@@ -11,7 +11,7 @@ RUN julia --project=/app --startup-file=no -e 'using Pkg; Pkg.instantiate()' \
     && chmod +x /app/start.sh \
     && rm -rf /depot/registries /depot/scratchspaces /depot/logs
 
-FROM julia:1.11.6-bookworm
+FROM julia:1.13.0-bookworm
 ENV JULIA_DEPOT_PATH=/depot
 WORKDIR /app
 COPY --from=build /depot /depot

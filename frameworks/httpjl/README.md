@@ -4,9 +4,9 @@ HTTP.jl on its stream handler, the plain server the Julia ecosystem builds on.
 
 ## Stack
 
-- **Language:** Julia 1.11
+- **Language:** Julia 1.13
 - **Framework:** HTTP.jl 2.6 over the Reseau transport
-- **Build:** `julia:1.11.6-bookworm`
+- **Build:** `julia:1.13.0-bookworm`
 
 ## Endpoints
 
@@ -30,10 +30,21 @@ The same routes are served over TLS on port 8081 for `json-tls`.
   quota first and the affinity mask after, and Julia takes the count at startup
   because it cannot be changed later
 - JSON serialized by JSON3 from a struct, so the field order is fixed
-- Compression is hand written with CodecZlib, because HTTP.jl ships no
-  compression middleware. This is what the entry declares `tuned` for. The
-  compressors are pooled, one per thread, since `deflateInit` allocates a few
-  hundred KB
+- Compression is hand written with LibDeflate, because HTTP.jl ships no
+  compression middleware. This is what the entry declares `tuned` for.
+  libdeflate gzips the same JSON to the same size or a little smaller than zlib
+  and does it about 2.5x faster. Compressors are held one per thread in a plain
+  vector, not a `Channel`: a channel serialises every take/put through one lock,
+  and at the 4096 connections of `json-comp` that lock, not the codec, was what
+  the profile was full of. One codec per thread is only safe because a Julia
+  task does not migrate between threads inside a non-yielding `gzip_compress!`
+  call
+- Request bodies are read with `readbytes!` into a small buffer instead of
+  `read(stream)`. HTTP.jl's `read(stream)` allocates a fresh 16 KiB vector per
+  call and grows the result with `append!`, which is 16 KiB of work for the
+  two-byte POST bodies the baseline profile sends; a body the first read does
+  not consume whole (large, or chunked in several frames) is read in further
+  pieces through the same buffer
 - Responses set Content-Length, which is what puts HTTP.jl on its fixed length
   path where head and body leave in a single write
 - json-tls is served by wrapping a `TCP.Listener` in a `TLS.Listener` and handing
